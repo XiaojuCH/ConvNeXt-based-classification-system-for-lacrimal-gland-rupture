@@ -11,22 +11,6 @@ from torchvision import transforms
 from models import create_model
 from skimage import measure
 from skimage.filters import frangi  # 添加血管增强滤波器
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    module="torchvision\\.models\\._utils"
-)
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message="You are using `torch.load` with `weights_only=False`"
-)
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    module="kornia\\.feature\\.lightglue"
-)
 
 # 环带参数 - 调整为更关注环带区域
 RING_CENTER = 0.375
@@ -334,5 +318,5 @@ def visualize_full_cam(image_path, checkpoint_path):
 
 
 if __name__ == "__main__":
-    # visualize_full_cam("222normal.png", "output/checkpoints/run_best.pth")
-    visualize_full_cam("image/images/val/normal/1556 (29).png", "output/checkpoints/run_best.pth")
+    visualize_full_cam("222break.png", "output/checkpoints/run_best.pth")
+    # visualize_full_cam("image/images/test/normal/100010 (44).png", "output/checkpoints/run_best.pth")

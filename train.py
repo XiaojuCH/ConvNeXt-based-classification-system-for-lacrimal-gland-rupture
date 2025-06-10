@@ -166,11 +166,11 @@ def _warmup_lambda(epoch):
 def main(input_root, output_root, num_epoch, model_name):
     # 1. 超参定义
     in_channels, num_classes = 4, 2
-    batch_size = 12
-    grad_accum_steps = 3  # 梯度累进步数，例如累积 2 个 batch 再更新
-    lr = 3e-5
-    wd = 1e-4
-    early_stop_patience = 20
+    batch_size = 16
+    grad_accum_steps = 2  # 梯度累进步数，例如累积 2 个 batch 再更新
+    lr = 5e-5
+    wd = 5e-4
+    early_stop_patience = 12
     num_workers = 4
 
     # 2. DataLoader（所有输入都已经在 dataset 里被 resize 到 512×512）
@@ -245,21 +245,15 @@ def main(input_root, output_root, num_epoch, model_name):
     ).to(device)
 
     # criterion = FocalRingLoss(alpha=0.8, gamma=2.0).to(device)
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.5]).to(device), label_smoothing=0.1).to(device)
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=wd,
-        betas=(0.9, 0.999),  # 保持稳定
-        eps=1e-8  # 提高数值稳定性
-    )
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.5]).to(device))
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     scheduler_warm = LambdaLR(optimizer, lr_lambda=_warmup_lambda)
 
     # 在此之上再用 ReduceLROnPlateau
     scheduler_plateau = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='max', patience=5, factor=0.5, threshold=1e-4
     )
-    scaler = amp.GradScaler(growth_interval=2000)
+    scaler = amp.GradScaler()
 
     train_losses, val_losses = [], []
     run_best_auc = 0.0
@@ -434,7 +428,7 @@ if __name__ == '__main__':
         '--num_epoch', type=int, default=60, help="训练轮数"
     )
     parser.add_argument(
-        '--model', default='convnext_small',
+        '--model', default='convnext_tiny',
         choices=['resnet18', 'resnet50', 'convnext_tiny', 'convnext_small'], help="网络型号"
     )
     args = parser.parse_args()

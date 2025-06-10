@@ -61,18 +61,6 @@ class EyeBreakDataset(Dataset):
         img = Image.open(path).convert('L')
         if img.size == (640, 480):
             img = img.resize((1272, 920), Image.BICUBIC)
-        # 1. 计算中心裁剪区域（保留图像中心70%）
-        width, height = img.size
-        crop_width = int(width * 0.7)
-        crop_height = int(height * 0.7)
-        left = (width - crop_width) // 2
-        top = (height - crop_height) // 2
-        right = left + crop_width
-        bottom = top + crop_height
-
-        # 2. 中心裁剪（移除30%边缘区域）
-        img = img.crop((left, top, right, bottom))
-
         img = img.resize((512, 512), Image.BICUBIC)
 
         # 2. 灰度复制到 3 通道 + ToTensor + Normalize
@@ -89,10 +77,8 @@ class EyeBreakDataset(Dataset):
         # 3. 生成环带高斯响应图 (1,512,512)
         ring_map = calculate_ring_map(
             512, 512,
-            r0=0.45,  # 同步调整
-            sigma=0.055,  # 同步调整
-            cx=256 * 1.1,  # 微调中心点 (原256)
-            cy=256 * 0.95  # 微调中心点
+            r0=self.r0,
+            sigma=self.sigma
         )  # (1,512,512)
 
         # 4. 边缘抑制掩码 (1,512,512)，减弱图像最边缘信息

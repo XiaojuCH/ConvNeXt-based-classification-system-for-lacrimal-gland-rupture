@@ -339,8 +339,8 @@ class CustomConvNeXt(nn.Module):
 
         # 3) 是否保留 Ring + ECA 注意力
         self.ring_attn = RingAttention(self.num_features,
-                               ring_center=0.45,
-                               sigma=0.055)
+                               ring_center=0.375,
+                               sigma=0.065)
         self.ring_enhancer = RingEnhancer(self.num_features)  # ← 新增环形增强
         self.eca_attn = ECAAttention(self.num_features, k_size=3)
         self.spatial_attn = SpatialAttention(kernel_size=7)
@@ -350,7 +350,7 @@ class CustomConvNeXt(nn.Module):
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2),
             nn.Linear(self.num_features, num_classes)
         )
 
