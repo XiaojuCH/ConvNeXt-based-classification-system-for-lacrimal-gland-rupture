@@ -1,176 +1,141 @@
 # dataset.py
 
 import os
-import math
-import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-class EyeBreakDataset(Dataset):
-    def __init__(self,
-                 root_dir,         # e.g. 'data'
-                 split,            # 'train' 或 'val' 或 'test'
-                 transform=None,   # 只对前 3 通道灰度做增强
-                 patch_size=224,
-                 center=(320,240), # 原图已对齐后圆心
-                 radius=200,       # 圆环半径
-                 train=True,
-                 K=8):
-        super().__init__()
-        self.root_dir = root_dir
-        self.split = split
-        self.transform = transform
-        self.patch_size = patch_size
-        self.center = center
-        self.radius = radius
-        self.train = train
-        self.K = K
+def calculate_ring_map(height, width, r0=0.5, sigma=0.1, cx=None, cy=None):
+    """
+    生成一个“环带响应图” (1, H, W)，
+    在归一化半径 r0 附近有最高响应，宽度由 sigma 控制。
+    r0: 环带中心半径占 (min(H,W)/2) 的比例，默认 0.5；
+    sigma: 环带宽度，默认 0.1。
+    """
+    if cx is None: cx = (width - 1) / 2.0
+    if cy is None: cy = (height - 1) / 2.0
+    ys = torch.arange(0, height).view(height, 1).expand(height, width)
+    xs = torch.arange(0, width).view(1, width).expand(height, width)
+    dist = torch.sqrt((xs - cx)**2 + (ys - cy)**2)
+    max_rad = min(height, width) / 2.0
+    # 归一化到 [0,1]
+    norm_dist = (dist / max_rad).clamp(0, 1)
+    # 环带高斯响应
+    ring = torch.exp(-0.5 * ((norm_dist - r0) / sigma)**2)
+    # 归一化到 [0,1]
+    ring = (ring - ring.min()) / (ring.max() - ring.min() + 1e-8)
+    return ring.unsqueeze(0)  # (1, H, W)
 
-        # 收集目录下所有图片路径与标签
-        self.images = []
+
+class EyeBreakDataset(Dataset):
+    """
+    4 通道输入：
+      - 前三通道：灰度复制 + 边缘抑制
+      - 第四通道：环带高斯响应图
+    """
+    def __init__(self, root_dir: str, split: str, transform=None,
+                 r0: float = 0.5, sigma: float = 0.1, edge_border: int = 30):
+        super().__init__()
+        self.transform = transform
+        self.r0 = r0
+        self.sigma = sigma
+        self.edge_border = edge_border
+
+        self.samples = []
         for cls_name, label in [('normal', 0), ('break', 1)]:
             folder = os.path.join(root_dir, split, cls_name)
             if not os.path.isdir(folder):
                 raise ValueError(f"目录不存在: {folder}")
-            for fname in os.listdir(folder):
-                if fname.lower().endswith(('.png','jpg','jpeg','bmp')):
-                    self.images.append((os.path.join(folder, fname), label))
+            for fn in sorted(os.listdir(folder)):
+                if fn.lower().endswith(('.png','.jpg','.jpeg','.bmp')):
+                    self.samples.append((os.path.join(folder, fn), label))
 
     def __len__(self):
-        return len(self.images)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, label = self.images[idx]
-        img = Image.open(img_path).convert('L')  # 灰度
-        img_np = np.array(img)                  # (H_orig, W_orig)
+        path, label = self.samples[idx]
 
-        patches = []
-        masks = []  # 添加 masks 列表
+        # 1. 读取灰度图并 resize 到 512×512
+        img = Image.open(path).convert('L')
+        if img.size == (640, 480):
+            img = img.resize((1272, 920), Image.BICUBIC)
+        # 1. 计算中心裁剪区域（保留图像中心70%）
+        width, height = img.size
+        crop_width = int(width * 0.7)
+        crop_height = int(height * 0.7)
+        left = (width - crop_width) // 2
+        top = (height - crop_height) // 2
+        right = left + crop_width
+        bottom = top + crop_height
 
-        for i in range(self.K):
-            # 训练时随机角度 + ±10px 半径抖动；验证/测试时等分角度 + 定半径
-            if self.train:
-                angle = np.random.uniform(0, 2*np.pi)
-                r_off = np.random.uniform(self.radius-10, self.radius+10)
-            else:
-                angle = 2*np.pi * i / self.K
-                r_off = self.radius
+        # 2. 中心裁剪（移除30%边缘区域）
+        img = img.crop((left, top, right, bottom))
 
-            x0, y0 = self.center
-            xi = int(x0 + r_off * math.cos(angle))
-            yi = int(y0 + r_off * math.sin(angle))
-            hs = self.patch_size // 2
+        img = img.resize((512, 512), Image.BICUBIC)
 
-            x1 = xi - hs
-            y1 = yi - hs
-            x2 = x1 + self.patch_size
-            y2 = y1 + self.patch_size
+        # 2. 灰度复制到 3 通道 + ToTensor + Normalize
+        if self.transform:
+            img3 = self.transform(img)  # (3,512,512)
+        else:
+            to_tensor = transforms.Compose([
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5]*3, [0.5]*3),
+            ])
+            img3 = to_tensor(img)
 
-            # 边界检查
-            H, W = img_np.shape
-            if x1 < 0:
-                x1, x2 = 0, self.patch_size
-            if y1 < 0:
-                y1, y2 = 0, self.patch_size
-            if x2 > W:
-                x2 = W
-                x1 = W - self.patch_size
-            if y2 > H:
-                y2 = H
-                y1 = H - self.patch_size
+        # 3. 生成环带高斯响应图 (1,512,512)
+        ring_map = calculate_ring_map(
+            512, 512,
+            r0=0.45,  # 同步调整
+            sigma=0.055,  # 同步调整
+            cx=256 * 1.1,  # 微调中心点 (原256)
+            cy=256 * 0.95  # 微调中心点
+        )  # (1,512,512)
 
-            patch_np = img_np[y1:y2, x1:x2]  # (224,224)
-            patch_pil = Image.fromarray(patch_np)
+        # 4. 边缘抑制掩码 (1,512,512)，减弱图像最边缘信息
+        edge_mask = torch.ones_like(ring_map)
+        b = self.edge_border
+        edge_mask[:, :b, :] = 0.2
+        edge_mask[:, -b:, :] = 0.2
+        edge_mask[:, :, :b] = 0.2
+        edge_mask[:, :, -b:] = 0.2
 
-            # ——— 前 3 通道：灰度重复或增强 ———
-            if self.transform:
-                patch_t_3 = self.transform(patch_pil)  # (3,224,224)
-            else:
-                to_tensor = transforms.Compose([
-                    transforms.Grayscale(num_output_channels=3),
-                    transforms.Resize((self.patch_size, self.patch_size)),
-                    transforms.ToTensor(),
-                    transforms.Normalize([0.5]*3, [0.5]*3),
-                ])
-                patch_t_3 = to_tensor(patch_pil)
+        # 5. 对前三通道做边缘抑制
+        img3 = img3 * edge_mask
 
-            # ——— 第 4 通道：径向距离归一化（radial） ———
-            # Patch 中心坐标 (cx, cy)：在 patch 内部坐标系下
-            cx = xi - x1
-            cy = yi - y1
-            Hs = self.patch_size
+        # 6. 拼成 4 通道
+        img4 = torch.cat([img3, ring_map], dim=0)  # (4,512,512)
 
-            yy = np.arange(0, Hs)
-            xx = np.arange(0, Hs)
-            grid_y, grid_x = np.meshgrid(yy, xx, indexing='ij')
-            dist = np.sqrt((grid_x - cx) ** 2 + (grid_y - cy) ** 2)
-            # 使用高斯分布增强边缘关注度，σ控制聚焦强度
-            sigma = self.radius * 0.1  # 可调整参数
-            radial = np.exp(-0.5 * ((dist - self.radius) / sigma) ** 2)
-            radial = (radial - radial.min()) / (radial.max() - radial.min())
-            radial = np.clip(radial, 0, 1)
-            radial_tensor = torch.from_numpy(radial).unsqueeze(0).float()  # (1,224,224)
+        return img4, label
 
-            # 拼接成 4 通道
-            patch_all = torch.cat([patch_t_3, radial_tensor], dim=0)  # (4,224,224)
-            patches.append(patch_all)
-
-            # 生成 mask
-            mask = torch.ones((1, 1, 1)) if dist.min() <= self.radius + 10 and dist.max() >= self.radius - 10 else torch.zeros((1, 1, 1))
-            masks.append(mask)
-
-        patches = torch.stack(patches, dim=0)  # (K,4,224,224)
-        masks = torch.stack(masks, dim=0)  # (K, 1, 1, 1)
-        return patches, label, img_path, masks
 
 def collate_fn_val(batch):
-    """
-    批量化处理：batch 中每个元素为 (patches, label, img_path, masks)。
-    最终输出：
-      all_patches: (batch_size*K, 4,224,224)
-      labels:      (batch_size,)
-      paths_list:  [img_path_1, img_path_2, …]
-      masks:       (batch_size*K, 1, 1, 1)
-    """
-    patches_list, labels_list, paths_list, masks_list = [], [], [], []
-    for all_patches, label, img_path, masks in batch:
-        patches_list.append(all_patches)  # 每个 all_patches=(K,4,224,224)
-        labels_list.append(label)
-        paths_list.append(img_path)
-        masks_list.append(masks)
+    imgs, labels = zip(*batch)
+    imgs = torch.stack(imgs, dim=0)
+    labels = torch.tensor(labels, dtype=torch.long)
+    return imgs, labels
 
-    batch_patches = torch.cat(patches_list, dim=0)    # (batch*K,4,224,224)
-    labels = torch.tensor(labels_list, dtype=torch.long)
-    masks = torch.cat(masks_list, dim=0)  # 拼接 masks
-    return batch_patches, labels, paths_list, masks
 
-def get_dataloader(root_dir,
-                   split,
+def get_dataloader(root_dir: str,
+                   split: str,
                    transform,
-                   batch_size,
-                   shuffle,
-                   num_workers,
-                   patch_size,
-                   center,
-                   radius,
-                   train,
-                   K):
-    """
-    返回一个 DataLoader，批次包含 (batch*K,4,224,224) 的 patch 张量
-    """
+                   batch_size: int,
+                   shuffle: bool,
+                   num_workers: int,
+                   r0=0.375,  # 环带中心
+                   sigma=0.065,  # 环带宽度
+                   edge_border=30,
+                   **kwargs):
     dataset = EyeBreakDataset(
         root_dir=root_dir,
         split=split,
         transform=transform,
-        patch_size=patch_size,
-        center=center,
-        radius=radius,
-        train=train,
-        K=K
+        **kwargs
     )
-    loader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
@@ -178,29 +143,26 @@ def get_dataloader(root_dir,
         pin_memory=True,
         collate_fn=collate_fn_val
     )
-    return loader
 
 
 if __name__ == '__main__':
-    # 测试示例：只是验证尺寸
-    train_transform = transforms.Compose([
+    # 简单测试
+    small_tf = transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((224,224)),
         transforms.ToTensor(),
         transforms.Normalize([0.5]*3, [0.5]*3),
     ])
     loader = get_dataloader(
         root_dir='data',
         split='train',
-        transform=train_transform,
+        transform=small_tf,
         batch_size=2,
         shuffle=False,
         num_workers=0,
-        patch_size=224,
-        center=(320,240),
-        radius=200,
-        train=True,
-        K=4
+        r0=0.5,            # 环带半径占最大半径的比例
+        sigma=0.1,         # 环带宽度
+        edge_border=30     # 边缘抑制宽度
     )
-    patches, labels, paths, masks = next(iter(loader))
-    print(f"patches shape: {patches.shape}, labels: {labels}, paths: {paths}, masks: {masks.shape}")
+    imgs, labels = next(iter(loader))
+    print("imgs.shape =", imgs.shape, ", labels =", labels)
+    # 期望：imgs.shape = torch.Size([2, 4, 512, 512])

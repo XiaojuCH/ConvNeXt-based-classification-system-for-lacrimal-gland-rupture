@@ -1,9 +1,9 @@
+# train.py
 # -*- coding: utf-8 -*-
 # @Author :Xiaoju
 # Time    : 2025/4/9
 
 import os
-import shutil
 import argparse
 import numpy as np
 import torch
@@ -11,13 +11,48 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import trange
 from torchvision import transforms
-import torch.nn.functional as F
-
-from models import ResNet18, ResNet50  # 已修改为可接受 in_channels=4
-from dataset import get_dataloader  # 产出 (batch*K, 4,224,224)
-from evaluator import getAUC, save_results  # 计算 AUC & 保存结果（CSV）
-
+from dataset import get_dataloader    # 上面已经改成统一 4×512×512
+from evaluator import getAUC, save_results
+import torch.utils.data as data
+from PIL import Image
+from confusion import (
+    plot_confusion,
+    save_classification_report,
+    plot_multiclass_pr_curve,
+    plot_loss_curve,
+    visualize_misclassified
+)
 import warnings
+from models import create_model  # 确保引入的是你修改后 forward 返回 (logits, attn_feat)
+
+
+class FocalRingLoss(nn.Module):
+    def __init__(self, alpha=0.8, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, logits, targets):
+        ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce)
+        loss = self.alpha * (1 - pt) ** self.gamma * ce
+        return loss.mean()
+
+def ring_regularization(attn_feat, radial_map, weight=0.1):
+    """
+    attn_feat: (B, C, H, W)  特征图
+    radial_map: (B,1,H_orig,W_orig)  原始径向图
+    """
+    # upsample radial_map 到 attn_feat 尺寸
+    _,C,H,W = attn_feat.shape
+    rm = nn.functional.interpolate(radial_map, size=(H,W), mode='bilinear', align_corners=False)
+    # 取一个通道平均响应
+    mean_feat = attn_feat.mean(dim=1)  # (B, H, W)
+    # 只保留环带 0.3~0.7 区间
+    mask = ((rm[:,0] > 0.3) & (rm[:,0] < 0.7)).float()  # (B,H,W)
+    # 惩罚模型在环带外响应，或鼓励环带上响应
+    ring_resp = (mean_feat * mask).mean()
+    return - weight * ring_resp
 
 warnings.filterwarnings(
     "ignore",
@@ -35,265 +70,373 @@ warnings.filterwarnings(
     module="kornia\\.feature\\.lightglue"
 )
 
-# —— 导入混合精度 AMP 模块 —— #
-from torch import amp
+from torch import amp  # 混合精度 AMP
+from torch.optim.lr_scheduler import LambdaLR
 
 
-def weighted_cross_entropy(logits, targets, mask, ring_weight=5.0):
-    """
-    logits: 模型输出 (B, 2)
-    targets: 真实标签 (B,)
-    mask: 环形区域掩码 (B,) - 1表示环形区域，0表示背景
-    ring_weight: 环形区域的惩罚权重
-    """
-    ce_loss = F.cross_entropy(logits, targets, reduction='none')
-    weights = torch.ones_like(mask)
-    weights[mask == 1] = ring_weight  # 环形区域错误的惩罚加重
-    weighted_loss = ce_loss * weights
-    return weighted_loss.mean()
-
-
-def evaluate_with_patches(model, loader, device, output_root, result_name,
-                          criterion=None, K=8, save_csv=True):
-    """
-    针对 Patch‐based 的验证/测试逻辑：
-    - loader 会输出 (batch_size*K, 4, 224,224) 的 all_patches 以及 (batch_size,) 的 labels 和 [paths_list]。
-    - 我们先按 patch 逐一跑过网络 → 得到 (batch_size*K, num_classes) 的 logits → softmax → (batch_size*K, num_classes) 的 probs。
-    - 然后 reshape 为 (batch_size, K, num_classes)，对 K 维度取平均 → (batch_size, num_classes)。
-    - 最后用 averaged probs 与原始 labels 计算 AUC/ACC，**仅在 save_csv=True 时**保存 CSV。
-    """
+def evaluate(model, loader, device, output_root, name, criterion=None, save_csv=True):
     model.eval()
     ys, yps, losses = [], [], []
 
     with torch.no_grad():
-        for all_patches, labels, paths, masks in loader:
-            # all_patches: (N*K, 4, 224,224), labels: (N,), paths: list 长度 N
-            all_patches = all_patches.to(device)  # (N*K,4,224,224)
-            labels = labels.to(device)  # (N,)
-            masks = masks.to(device)
+        for imgs, labels in loader:
+            imgs = imgs.to(device)       # (B,4,512,512)
+            labels = labels.to(device)   # (B,)
 
-            logits = model(all_patches)  # (N*K, num_classes)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()  # (N*K, num_classes)
+            logits = model(imgs)         # (B,2)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()  # (B,2)
 
-            # 计算 loss：需要把 labels 重复 K 次
             if criterion is not None:
-                N = labels.shape[0]
-                K_ = probs.shape[0] // N
-                repeated_labels = labels.unsqueeze(1).repeat(1, K_).view(-1)  # (N*K,)
-                mask_flat = masks[:, 0, 0, 0]  # 假设mask是(B*K,1,1,1)
-                loss_val = criterion(logits, repeated_labels, mask_flat).item()
+                loss_val = criterion(logits, labels).item()
                 losses.append(loss_val)
 
-            # reshape 为 (N, K, num_classes)
-            N = labels.shape[0]
-            num_classes = probs.shape[1]
-            probs = probs.reshape(N, -1, num_classes)  # (N, K, num_classes)
-            avg_probs = np.mean(probs, axis=1)  # (N, num_classes)
-
             ys.append(labels.cpu().numpy())
-            yps.append(avg_probs)
+            yps.append(probs)
 
-    y_true = np.concatenate(ys, axis=0)  # (num_samples,)
-    y_score = np.concatenate(yps, axis=0)  # (num_samples, num_classes)
-
-    # 二分类时，用正类分数（索引 1）
-    y_score_pos = y_score[:, 1]
+    y_true = np.concatenate(ys, axis=0)    # (N,)
+    y_score = np.concatenate(yps, axis=0)  # (N,2)
+    y_score_pos = y_score[:, 1]            # 取“断裂”类别的概率
 
     auc = getAUC(y_true, y_score_pos, task="binary")
     preds = (y_score_pos > 0.5).astype(int)
     acc = (preds == y_true).mean()
 
     avg_loss = np.mean(losses) if losses else None
-    print(f'[{result_name}] AUC: {auc:.4f}  ACC: {acc:.4f}' +
-          (f'  LOSS: {avg_loss:.4f}' if avg_loss is not None else ''))
+    print(f"[{name}] AUC: {auc:.4f}  ACC: {acc:.4f}" +
+          (f"  LOSS: {avg_loss:.4f}" if avg_loss is not None else ""))
 
     if save_csv:
         os.makedirs(output_root, exist_ok=True)
-        save_results(y_true, y_score, os.path.join(output_root, result_name + ".csv"))
+        save_results(y_true, y_score, os.path.join(output_root, name + ".csv"))
 
     return auc, acc, avg_loss
 
 
+class WholeImageDataset(torch.utils.data.Dataset):
+    """
+    专门给画混淆矩阵 / 报告用的“整图”Dataset：
+    同样把原图灰度化、resize到 512×512，再拼 4 通道。
+    """
+    def __init__(self, root_dir: str, split: str, transform=None):
+        super().__init__()
+        self.samples = []
+        for cls_name, lb in [('normal', 0), ('break', 1)]:
+            folder = os.path.join(root_dir, split, cls_name)
+            if not os.path.isdir(folder):
+                raise ValueError(f"目录不存在: {folder}")
+            for fn in sorted(os.listdir(folder)):
+                if fn.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+                    self.samples.append((os.path.join(folder, fn), lb))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, lb = self.samples[idx]
+        img_gray = Image.open(path).convert('L')
+        if img_gray.size == (640, 480):
+            img_gray = img_gray.resize((1272, 920), Image.BICUBIC)
+        img_gray = img_gray.resize((512, 512), Image.BICUBIC)
+
+        if self.transform:
+            img3 = self.transform(img_gray)  # (3,512,512)
+        else:
+            t = transforms.Compose([
+                transforms.Grayscale(num_output_channels=3),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5]*3, [0.5]*3),
+            ])
+            img3 = t(img_gray)
+
+        # 生成径向图 (1,512,512)
+        cy, cx = 512/2.0, 512/2.0
+        ys = torch.arange(0, 512).view(512, 1).expand(512, 512)
+        xs = torch.arange(0, 512).view(1, 512).expand(512, 512)
+        dist = torch.sqrt((xs - cx)**2 + (ys - cy)**2)
+        radial = (dist / (512/2.0)).clamp(0, 1).unsqueeze(0).float()  # (1,640,640)
+
+        img4 = torch.cat([img3, radial], dim=0)  # (4,640,640)
+        return img4, lb
+
+
+def _warmup_lambda(epoch):
+    return min(1.0, (epoch + 1) / 5)
+
 def main(input_root, output_root, num_epoch, model_name):
-    # —— 1. 超参定义 —— #
-    # 输入通道数改为 4（前三通道为灰度，第四通道为径向距离先验）
+    # 1. 超参定义
     in_channels, num_classes = 4, 2
-    batch_size_train = 16
-    batch_size_eval = 8
-    lr, wd = 5e-4, 1e-4
-    early_stop_patience = 15
+    batch_size = 12
+    grad_accum_steps = 3  # 梯度累进步数，例如累积 2 个 batch 再更新
+    lr = 3e-5
+    wd = 1e-4
+    early_stop_patience = 20
     num_workers = 4
 
-    # Patch‐based 相关参数（需根据实际对齐圆心/半径调整）
-    patch_size = 224
-    center = (320, 240)  # 圆心坐标 (x0,y0)——建议按给定数据集对齐后测得的固定值
-    radius = 200  # 圆环半径（像素）
-    K = 8  # 每张图切取的 Patch 数量
-
-    # —— 2. 数据预处理与增强 —— #
-    # 注意：这里只对前三通道（灰度复制到 3 通道）做增强，Dataset 内会自动拼第 4 通道
+    # 2. DataLoader（所有输入都已经在 dataset 里被 resize 到 512×512）
     train_tf = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10, fill=(128,)),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
         transforms.Grayscale(num_output_channels=3),
-        transforms.ColorJitter(brightness=0.05, contrast=0.05),
-        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.3),
         transforms.ToTensor(),
         transforms.Normalize([0.5] * 3, [0.5] * 3),
     ])
     eval_tf = transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5] * 3, [0.5] * 3),
+        transforms.Normalize([0.5]*3, [0.5]*3),
     ])
 
-    # —— 3. 构造 DataLoader —— #
     train_loader = get_dataloader(
         root_dir=input_root,
         split='train',
         transform=train_tf,
-        batch_size=batch_size_train,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        patch_size=patch_size,
-        center=center,
-        radius=radius,
-        train=True,
-        K=K,
+        num_workers=num_workers
     )
     val_loader = get_dataloader(
         root_dir=input_root,
         split='val',
         transform=eval_tf,
-        batch_size=batch_size_eval,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        patch_size=patch_size,
-        center=center,
-        radius=radius,
-        train=False,
-        K=K,
+        num_workers=num_workers
     )
     test_loader = get_dataloader(
         root_dir=input_root,
         split='test',
         transform=eval_tf,
-        batch_size=batch_size_eval,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        patch_size=patch_size,
-        center=center,
-        radius=radius,
-        train=False,
-        K=K,
+        num_workers=num_workers
     )
 
-    # —— 4. 模型、损失函数、优化器、调度器 —— #
+    # “整图”用来画混淆 / 报告
+    full_tf = transforms.Compose([
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+    train_loader_full = data.DataLoader(
+        WholeImageDataset(input_root, 'train', transform=full_tf),
+        batch_size=16, shuffle=False, num_workers=num_workers, pin_memory=True
+    )
+    val_loader_full = data.DataLoader(
+        WholeImageDataset(input_root, 'val', transform=full_tf),
+        batch_size=16, shuffle=False, num_workers=num_workers, pin_memory=True
+    )
+    test_loader_full = data.DataLoader(
+        WholeImageDataset(input_root, 'test', transform=full_tf),
+        batch_size=16, shuffle=False, num_workers=num_workers, pin_memory=True
+    )
+
+    # 3. 模型、损失、优化器、调度器
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    model_cls = ResNet50 if model_name.lower() == 'resnet50' else ResNet18
-    model = model_cls(in_channels=in_channels, num_classes=num_classes).to(device)
+    model = create_model(
+        model_name=model_name,      # 'resnet18' 或 'resnet50'
+        in_channels=in_channels,
+        num_classes=num_classes,
+        pretrained=True,
+        local_weights_dir='D:/Projects_/Tears_Check/pretrained'
+    ).to(device)
 
-    # 这里使用带类别权重的 Focal Loss（也可以换为 CrossEntropy + label_smoothing）
-    cnt0 = len(os.listdir(os.path.join(input_root, 'train', 'normal')))
-    cnt1 = len(os.listdir(os.path.join(input_root, 'train', 'break')))
-    total = cnt0 + cnt1
-    w0 = total / (2 * cnt0)
-    w1 = total / (2 * cnt1)
-    class_weights = torch.tensor([w0, w1]).to(device)
+    # criterion = FocalRingLoss(alpha=0.8, gamma=2.0).to(device)
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.5]).to(device), label_smoothing=0.1).to(device)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=wd,
+        betas=(0.9, 0.999),  # 保持稳定
+        eps=1e-8  # 提高数值稳定性
+    )
+    scheduler_warm = LambdaLR(optimizer, lr_lambda=_warmup_lambda)
 
-    def focal_loss(inputs, targets, alpha=None, gamma=2):
-        logpt = -nn.functional.cross_entropy(inputs, targets, weight=alpha, reduction='none')
-        pt = torch.exp(logpt)
-        loss = -((1 - pt) ** gamma) * logpt
-        return loss.mean()
+    # 在此之上再用 ReduceLROnPlateau
+    scheduler_plateau = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=5, factor=0.5, threshold=1e-4
+    )
+    scaler = amp.GradScaler(growth_interval=2000)
 
-    criterion = lambda x, y, mask: weighted_cross_entropy(x, y, mask, ring_weight=5.0)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
-
-    # —— ★ 混合精度 AMP —— #
-    scaler = amp.GradScaler()  # 默认 device_type='cuda'
-
-    # —— 5. 训练 + 验证循环 —— #
+    train_losses, val_losses = [], []
     run_best_auc = 0.0
-    no_improve = 0
-
-    for epoch in trange(1, num_epoch + 1, desc="Epochs"):
-        # —— 5.1 训练模式 —— #
+    early_cnt = 0
+    for epoch in trange(1, num_epoch+1, desc="Epochs"):
+        # —— 训练 —— #
         model.train()
-        train_loss_accum = 0.0
+        total_train_loss = 0.0
+        optimizer.zero_grad()
+        for step, (imgs, labels) in enumerate(train_loader, start=1):
+            imgs  = imgs.to(device)   # (B,4,512,512)
+            labels= labels.to(device)
 
-        for imgs, labels, paths, masks in train_loader:  # 添加 masks 信息
-            # imgs: (batch_size*K, 4,224,224), labels: (batch_size,)
-            imgs = imgs.to(device)
-            labels = labels.to(device)
-            masks = masks.to(device)  # 将 masks 移动到设备上
-
-            optimizer.zero_grad()
-
-            # —— 在 torch.amp.autocast 作用域内前向和计算 loss —— #
             with amp.autocast(device_type='cuda'):
-                logits = model(imgs)  # (batch_size*K, 2)
+                out = model(imgs)
+                logits, attn_feat = out if isinstance(out,(tuple,list)) else (out, None)
+                loss = criterion(logits, labels) / grad_accum_steps
+                if attn_feat is not None:
+                    radial_map = imgs[:,3:4,:,:]
+                    loss = loss + ring_regularization(attn_feat, radial_map, weight=0.1)
 
-                # 重复 labels 为 (batch*K,) 以匹配 logits
-                N = labels.shape[0]
-                repeated_labels = labels.unsqueeze(1).repeat(1, K).view(-1)  # (N*K,)
-                mask_flat = masks[:, 0, 0, 0]  # 假设 mask 是 (B*K,1,1,1)
-                loss = criterion(logits, repeated_labels, mask_flat)  # 传递 mask 参数
-
-            # —— 用 scaler 进行反向传播和步进 —— #
             scaler.scale(loss).backward()
+            total_train_loss += loss.item() * imgs.size(0)
+            if step % grad_accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler_warm.step()
+
+        # 尾部更新
+        if len(train_loader) % grad_accum_steps != 0:
             scaler.step(optimizer)
             scaler.update()
+            optimizer.zero_grad()
 
-            # 按“图”统计 loss：loss 本身是平均每 patch，这里乘回 patch 数即可
-            train_loss_accum += loss.item() * N
 
-        avg_train_loss = train_loss_accum / len(train_loader.dataset)
-        print(f"[Epoch {epoch}/{num_epoch}] Train Loss: {avg_train_loss:.10f}")
+        avg_train_loss = total_train_loss / len(train_loader.dataset)
+        train_losses.append(avg_train_loss)
+        print(f"[Epoch {epoch}] Train Loss: {avg_train_loss:.6f}")
 
-        # —— 5.2 验证模式（不保存 CSV） —— #
-        print(f"[Epoch {epoch}/{num_epoch}] Validation:")
-        val_auc, val_acc, val_loss = evaluate_with_patches(
-            model, val_loader, device, output_root, f'val_epoch{epoch}',
-            criterion, K=K, save_csv=False
-        )
-        scheduler.step(val_auc)
+        # —— 验证 —— #
+        model.eval()
+        total_val_loss = 0.0
+        ys, yps = [], []
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs   = imgs.to(device)
+                labels = labels.to(device)
+                out    = model(imgs)
+                logits,_ = out if isinstance(out,(tuple,list)) else (out,None)
+                loss   = criterion(logits, labels)
+                total_val_loss += loss.item()*imgs.size(0)
+                probs  = torch.softmax(logits,dim=1).cpu().numpy()
+                ys.append(labels.cpu().numpy())
+                yps.append(probs)
 
-        # —— Early Stopping & 保存本次 run_best —— #
-        if val_auc > run_best_auc:
+        avg_val_loss = total_val_loss / len(val_loader.dataset)
+        val_losses.append(avg_val_loss)
+        y_true = np.concatenate(ys,axis=0)
+        y_score= np.concatenate(yps,axis=0)
+        val_auc= getAUC(y_true, y_score[:,1], task="binary")
+        val_acc= ((y_score[:,1]>0.5).astype(int)==y_true).mean()
+        print(f"[Epoch {epoch}] Val AUC: {val_auc:.4f}  ACC: {val_acc:.4f}  Val Loss: {avg_val_loss:.6f}")
+
+        scheduler_plateau.step(val_auc)
+        if val_auc > run_best_auc + 1e-5:
             run_best_auc = val_auc
-            save_path = os.path.join(output_root, 'checkpoints', 'run_best.pth')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            torch.save({'net': model.state_dict(), 'epoch': epoch, 'val_auc': val_auc}, save_path)
-            no_improve = 0
-            print(f">>> New run-best at epoch {epoch}, AUC={val_auc:.4f} ACC={val_acc:.4f}")
+            early_cnt = 0
+            ckpt_path = os.path.join(output_root,'checkpoints','run_best.pth')
+            os.makedirs(os.path.dirname(ckpt_path),exist_ok=True)
+            torch.save({'net':model.state_dict(),'epoch':epoch,'val_auc':val_auc}, ckpt_path)
+            print(f">>> New run‐best at epoch {epoch}: AUC={val_auc:.4f} ACC={val_acc:.4f}")
         else:
-            no_improve += 1
-            if no_improve >= early_stop_patience:
-                print(f"No AUC improvement in {early_stop_patience} epochs. Stopping training.")
+            early_cnt += 1
+            if early_cnt >= early_stop_patience:
+                print(f"No AUC improvement in {early_stop_patience} epochs. Early stopping.")
                 break
 
-    # —— 6. 测试阶段（保留 CSV） —— #
-    print("\n===== Testing RUN-BEST model =====")
+    # 5. 测试阶段 (Final + Run-Best)
+    print("\n===== Testing FINAL Model =====")
+    test_auc, test_acc, test_loss = evaluate(
+        model, test_loader, device, output_root, 'test_final',
+        criterion, save_csv=True
+    )
+    # print(f"[Test Final] AUC: {test_auc:.4f}  ACC: {test_acc:.4f}")
+
+    print("\n===== Testing RUN‐BEST Model =====")
     ckpt = torch.load(os.path.join(output_root, 'checkpoints', 'run_best.pth'))
     model.load_state_dict(ckpt['net'])
-    test_auc, test_acc, test_loss = evaluate_with_patches(
+    test_auc_rb, test_acc_rb, test_loss_rb = evaluate(
         model, test_loader, device, output_root, 'test_run_best',
-        criterion, K=K, save_csv=True
+        criterion, save_csv=True
     )
-    print(f"[Test Result] AUC: {test_auc:.4f}  ACC: {test_acc:.4f}" +
-          (f"  LOSS: {test_loss:.10f}" if test_loss is not None else ""))
+    # print(f"[Test Run-Best] AUC: {test_auc_rb:.4f}  ACC: {test_acc_rb:.4f}")
+
+    # 6. 生成可视化报告
+    print("\n===== 生成可视化报告 =====")
+    best_model = create_model(
+        model_name=model_name,
+        in_channels=in_channels,
+        num_classes=num_classes,
+        pretrained=False
+    ).to(device)
+    ckpt2 = torch.load(os.path.join(output_root, 'checkpoints', 'run_best.pth'), map_location=device)
+    best_model.load_state_dict(ckpt2['net'])
+    best_model.eval()
+
+    best_thresh = 0.5
+    class_names = ["Normal", "Break"]
+
+    # 6.1 绘制混淆矩阵：Train / Val / Test
+    plot_confusion(
+        best_model,
+        train_loader_full,
+        device,
+        os.path.join(output_root, "confusion_train.png"),
+        class_names
+    )
+    plot_confusion(
+        best_model,
+        val_loader_full,
+        device,
+        os.path.join(output_root, "confusion_val.png"),
+        class_names
+    )
+    plot_confusion(
+        best_model,
+        test_loader_full,
+        device,
+        os.path.join(output_root, "confusion_test.png"),
+        class_names
+    )
+
+    # 6.2 保存分类报告：Train / Val / Test
+    save_classification_report(
+        best_model, train_loader_full, device,
+        out_txt_path=os.path.join(output_root, "report_train_runbest.txt"),
+        best_thresh=best_thresh, class_names=class_names
+    )
+    save_classification_report(
+        best_model, val_loader_full, device,
+        out_txt_path=os.path.join(output_root, "report_val_runbest.txt"),
+        best_thresh=best_thresh, class_names=class_names
+    )
+    save_classification_report(
+        best_model, test_loader_full, device,
+        out_txt_path=os.path.join(output_root, "report_test_runbest.txt"),
+        best_thresh=best_thresh, class_names=class_names
+    )
+
+    # 6.3 绘制 Loss 曲线
+    plot_loss_curve(
+        train_losses, val_losses,
+        out_path=os.path.join(output_root, "loss_curve.png")
+    )
+
+    print("所有可视化已生成，保存在：", output_root)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_root', required=True,
-                        help="数据集根目录，应包含 train/val/test 三个子文件夹")
-    parser.add_argument('--output_root', default='./output', help="结果保存目录")
-    parser.add_argument('--num_epoch', type=int, default=20, help="训练轮数")
-    parser.add_argument('--model', default='resnet50',
-                        choices=['resnet18', 'resnet50'], help="网络型号")
+    parser.add_argument(
+        '--input_root', required=True,
+        help="数据集根目录，应包含 train/val/test 三个子文件夹"
+    )
+    parser.add_argument(
+        '--output_root', default='./output', help="结果保存目录"
+    )
+    parser.add_argument(
+        '--num_epoch', type=int, default=60, help="训练轮数"
+    )
+    parser.add_argument(
+        '--model', default='convnext_small',
+        choices=['resnet18', 'resnet50', 'convnext_tiny', 'convnext_small'], help="网络型号"
+    )
     args = parser.parse_args()
 
     main(args.input_root, args.output_root, args.num_epoch, args.model)
