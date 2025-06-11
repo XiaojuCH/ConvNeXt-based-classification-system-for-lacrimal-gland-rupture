@@ -143,13 +143,24 @@ def save_classification_report(model, loader, device, out_txt_path, best_thresh,
     lines = report.strip().split("\n")
     print(f"\nClassification Report:\n")
     # 只打印前三行表头 + 每类一行 + 最后一行 avg/total
+    # 打印表头（前两行）
     for ln in lines[:2]:
         print(ln)
-    for cls in class_names if class_names else [f"Class{i}" for i in range(len(lines)-4)]:
+
+    # 提取每类指标并格式化输出
+    for cls in class_names if class_names else [f"Class{i}" for i in range(len(lines) - 4)]:
         for ln in lines:
             if ln.startswith(cls):
-                print(ln)
+                # 分割行数据（假设用空格分隔）
+                parts = [p for p in ln.split() if p]
+                if len(parts) >= 5:  # 确保有足够的字段
+                    # 格式化：类别左对齐，指标右对齐，保留两位小数
+                    formatted_line = f"{parts[0]:<15} {float(parts[1]):>6.2f} {float(parts[2]):>6.2f} {float(parts[3]):>6.2f} {int(parts[4]):>6}"
+                    print(formatted_line)
+                else:
+                    print(ln)  # 异常情况直接打印
                 break
+
     print(lines[-1])  # 打印最后一行总体指标
 
 

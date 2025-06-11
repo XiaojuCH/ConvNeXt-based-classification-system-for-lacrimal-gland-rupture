@@ -145,7 +145,8 @@ class WholeImageDataset(torch.utils.data.Dataset):
             t = transforms.Compose([
                 transforms.Grayscale(num_output_channels=3),
                 transforms.ToTensor(),
-                transforms.Normalize([0.5]*3, [0.5]*3),
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225]),
             ])
             img3 = t(img_gray)
 
@@ -170,7 +171,7 @@ def main(input_root, output_root, num_epoch, model_name):
     grad_accum_steps = 2  # 梯度累进步数，例如累积 2 个 batch 再更新
     lr = 5e-5
     wd = 5e-4
-    early_stop_patience = 12
+    early_stop_patience = 18
     num_workers = 4
 
     # 2. DataLoader（所有输入都已经在 dataset 里被 resize 到 512×512）
@@ -180,12 +181,14 @@ def main(input_root, output_root, num_epoch, model_name):
         transforms.ColorJitter(brightness=0.1, contrast=0.1),
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5] * 3, [0.5] * 3),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225]),
     ])
     eval_tf = transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225]),
     ])
 
     train_loader = get_dataloader(
@@ -217,7 +220,8 @@ def main(input_root, output_root, num_epoch, model_name):
     full_tf = transforms.Compose([
         transforms.Grayscale(num_output_channels=3),
         transforms.ToTensor(),
-        transforms.Normalize([0.5]*3, [0.5]*3),
+        transforms.Normalize([0.485, 0.456, 0.406],
+                             [0.229, 0.224, 0.225]),
     ])
     train_loader_full = data.DataLoader(
         WholeImageDataset(input_root, 'train', transform=full_tf),
