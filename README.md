@@ -1,5 +1,5 @@
 # 项目概要
-__基于Resnet的泪腺破裂分类系统<br>Resnet-based-classification-system-for-lacrimal-gland-rupture__
+__基于ConvNeXt的泪腺破裂分类系统<br>ConvNeXt-based-classification-system-for-lacrimal-gland-rupture__
 
 # 可视化效果
 ![002](https://github.com/user-attachments/assets/2b407792-ea2e-485b-ab5d-532487a1f924)
