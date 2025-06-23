@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import trange
 from torchvision import transforms
-from dataset import get_dataloader    # 上面已经改成统一 4×512×512
+from dataset import get_dataloader  # 上面已经改成统一 4×512×512
 from evaluator import getAUC, save_results
 import torch.utils.data as data
 from PIL import Image
@@ -38,21 +38,23 @@ class FocalRingLoss(nn.Module):
         loss = self.alpha * (1 - pt) ** self.gamma * ce
         return loss.mean()
 
+
 def ring_regularization(attn_feat, radial_map, weight=0.1):
     """
     attn_feat: (B, C, H, W)  特征图
     radial_map: (B,1,H_orig,W_orig)  原始径向图
     """
     # upsample radial_map 到 attn_feat 尺寸
-    _,C,H,W = attn_feat.shape
-    rm = nn.functional.interpolate(radial_map, size=(H,W), mode='bilinear', align_corners=False)
+    _, C, H, W = attn_feat.shape
+    rm = nn.functional.interpolate(radial_map, size=(H, W), mode='bilinear', align_corners=False)
     # 取一个通道平均响应
     mean_feat = attn_feat.mean(dim=1)  # (B, H, W)
     # 只保留环带 0.3~0.7 区间
-    mask = ((rm[:,0] > 0.3) & (rm[:,0] < 0.7)).float()  # (B,H,W)
+    mask = ((rm[:, 0] > 0.3) & (rm[:, 0] < 0.7)).float()  # (B,H,W)
     # 惩罚模型在环带外响应，或鼓励环带上响应
     ring_resp = (mean_feat * mask).mean()
     return - weight * ring_resp
+
 
 warnings.filterwarnings(
     "ignore",
@@ -80,10 +82,10 @@ def evaluate(model, loader, device, output_root, name, criterion=None, save_csv=
 
     with torch.no_grad():
         for imgs, labels in loader:
-            imgs = imgs.to(device)       # (B,4,512,512)
-            labels = labels.to(device)   # (B,)
+            imgs = imgs.to(device)  # (B,4,512,512)
+            labels = labels.to(device)  # (B,)
 
-            logits = model(imgs)         # (B,2)
+            logits = model(imgs)  # (B,2)
             probs = torch.softmax(logits, dim=1).cpu().numpy()  # (B,2)
 
             if criterion is not None:
@@ -93,9 +95,9 @@ def evaluate(model, loader, device, output_root, name, criterion=None, save_csv=
             ys.append(labels.cpu().numpy())
             yps.append(probs)
 
-    y_true = np.concatenate(ys, axis=0)    # (N,)
+    y_true = np.concatenate(ys, axis=0)  # (N,)
     y_score = np.concatenate(yps, axis=0)  # (N,2)
-    y_score_pos = y_score[:, 1]            # 取“断裂”类别的概率
+    y_score_pos = y_score[:, 1]  # 取“断裂”类别的概率
 
     auc = getAUC(y_true, y_score_pos, task="binary")
     preds = (y_score_pos > 0.5).astype(int)
@@ -117,6 +119,7 @@ class WholeImageDataset(torch.utils.data.Dataset):
     专门给画混淆矩阵 / 报告用的“整图”Dataset：
     同样把原图灰度化、resize到 512×512，再拼 4 通道。
     """
+
     def __init__(self, root_dir: str, split: str, transform=None):
         super().__init__()
         self.samples = []
@@ -151,11 +154,11 @@ class WholeImageDataset(torch.utils.data.Dataset):
             img3 = t(img_gray)
 
         # 生成径向图 (1,512,512)
-        cy, cx = 512/2.0, 512/2.0
+        cy, cx = 512 / 2.0, 512 / 2.0
         ys = torch.arange(0, 512).view(512, 1).expand(512, 512)
         xs = torch.arange(0, 512).view(1, 512).expand(512, 512)
-        dist = torch.sqrt((xs - cx)**2 + (ys - cy)**2)
-        radial = (dist / (512/2.0)).clamp(0, 1).unsqueeze(0).float()  # (1,640,640)
+        dist = torch.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+        radial = (dist / (512 / 2.0)).clamp(0, 1).unsqueeze(0).float()  # (1,640,640)
 
         img4 = torch.cat([img3, radial], dim=0)  # (4,640,640)
         return img4, lb
@@ -164,11 +167,12 @@ class WholeImageDataset(torch.utils.data.Dataset):
 def _warmup_lambda(epoch):
     return min(1.0, (epoch + 1) / 5)
 
+
 def main(input_root, output_root, num_epoch, model_name):
     # 1. 超参定义
     in_channels, num_classes = 4, 2
-    batch_size = 16
-    grad_accum_steps = 2  # 梯度累进步数，例如累积 2 个 batch 再更新
+    batch_size = 12
+    grad_accum_steps = 3  # 梯度累进步数，例如累积 2 个 batch 再更新
     lr = 5e-5
     wd = 5e-4
     early_stop_patience = 18
@@ -241,7 +245,7 @@ def main(input_root, output_root, num_epoch, model_name):
     print("Using device:", device)
 
     model = create_model(
-        model_name=model_name,      # 'resnet18' 或 'resnet50'
+        model_name=model_name,  # 'resnet18' 或 'resnet50'
         in_channels=in_channels,
         num_classes=num_classes,
         pretrained=True,
@@ -262,21 +266,21 @@ def main(input_root, output_root, num_epoch, model_name):
     train_losses, val_losses = [], []
     run_best_auc = 0.0
     early_cnt = 0
-    for epoch in trange(1, num_epoch+1, desc="Epochs"):
+    for epoch in trange(1, num_epoch + 1, desc="Epochs"):
         # —— 训练 —— #
         model.train()
         total_train_loss = 0.0
         optimizer.zero_grad()
         for step, (imgs, labels) in enumerate(train_loader, start=1):
-            imgs  = imgs.to(device)   # (B,4,512,512)
-            labels= labels.to(device)
+            imgs = imgs.to(device)  # (B,4,512,512)
+            labels = labels.to(device)
 
             with amp.autocast(device_type='cuda'):
                 out = model(imgs)
-                logits, attn_feat = out if isinstance(out,(tuple,list)) else (out, None)
+                logits, attn_feat = out if isinstance(out, (tuple, list)) else (out, None)
                 loss = criterion(logits, labels) / grad_accum_steps
                 if attn_feat is not None:
-                    radial_map = imgs[:,3:4,:,:]
+                    radial_map = imgs[:, 3:4, :, :]
                     loss = loss + ring_regularization(attn_feat, radial_map, weight=0.1)
 
             scaler.scale(loss).backward()
@@ -295,7 +299,6 @@ def main(input_root, output_root, num_epoch, model_name):
             scaler.update()
             optimizer.zero_grad()
 
-
         avg_train_loss = total_train_loss / len(train_loader.dataset)
         train_losses.append(avg_train_loss)
         print(f"[Epoch {epoch}] Train Loss: {avg_train_loss:.6f}")
@@ -306,31 +309,31 @@ def main(input_root, output_root, num_epoch, model_name):
         ys, yps = [], []
         with torch.no_grad():
             for imgs, labels in val_loader:
-                imgs   = imgs.to(device)
+                imgs = imgs.to(device)
                 labels = labels.to(device)
-                out    = model(imgs)
-                logits,_ = out if isinstance(out,(tuple,list)) else (out,None)
-                loss   = criterion(logits, labels)
-                total_val_loss += loss.item()*imgs.size(0)
-                probs  = torch.softmax(logits,dim=1).cpu().numpy()
+                out = model(imgs)
+                logits, _ = out if isinstance(out, (tuple, list)) else (out, None)
+                loss = criterion(logits, labels)
+                total_val_loss += loss.item() * imgs.size(0)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
                 ys.append(labels.cpu().numpy())
                 yps.append(probs)
 
         avg_val_loss = total_val_loss / len(val_loader.dataset)
         val_losses.append(avg_val_loss)
-        y_true = np.concatenate(ys,axis=0)
-        y_score= np.concatenate(yps,axis=0)
-        val_auc= getAUC(y_true, y_score[:,1], task="binary")
-        val_acc= ((y_score[:,1]>0.5).astype(int)==y_true).mean()
+        y_true = np.concatenate(ys, axis=0)
+        y_score = np.concatenate(yps, axis=0)
+        val_auc = getAUC(y_true, y_score[:, 1], task="binary")
+        val_acc = ((y_score[:, 1] > 0.5).astype(int) == y_true).mean()
         print(f"[Epoch {epoch}] Val AUC: {val_auc:.4f}  ACC: {val_acc:.4f}  Val Loss: {avg_val_loss:.6f}")
 
         scheduler_plateau.step(val_auc)
         if val_auc > run_best_auc + 1e-5:
             run_best_auc = val_auc
             early_cnt = 0
-            ckpt_path = os.path.join(output_root,'checkpoints','run_best.pth')
-            os.makedirs(os.path.dirname(ckpt_path),exist_ok=True)
-            torch.save({'net':model.state_dict(),'epoch':epoch,'val_auc':val_auc}, ckpt_path)
+            ckpt_path = os.path.join(output_root, 'checkpoints', 'run_best.pth')
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            torch.save({'net': model.state_dict(), 'epoch': epoch, 'val_auc': val_auc}, ckpt_path)
             print(f">>> New run‐best at epoch {epoch}: AUC={val_auc:.4f} ACC={val_acc:.4f}")
         else:
             early_cnt += 1
@@ -438,3 +441,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     main(args.input_root, args.output_root, args.num_epoch, args.model)
+
+# sp注意力换成co

@@ -147,8 +147,8 @@ if __name__ == '__main__':
         batch_size=2,
         shuffle=False,
         num_workers=0,
-        r0=0.5,            # 环带半径占最大半径的比例
-        sigma=0.1,         # 环带宽度
+        r0=0.375,            # 环带半径占最大半径的比例
+        sigma=0.14,         # 环带宽度
         edge_border=30     # 边缘抑制宽度
     )
     imgs, labels = next(iter(loader))
